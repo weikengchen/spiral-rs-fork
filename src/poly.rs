@@ -443,9 +443,13 @@ pub fn sub_poly_into(params: &Params, res: &mut [u64], a: &[u64]) {
     }
 }
 
+fn negate_mod(val: u64, m: u64) -> u64 {
+    if val == 0 { 0 } else { m - val }
+}
+
 pub fn invert_poly(params: &Params, res: &mut [u64], a: &[u64]) {
     for i in 0..params.poly_len {
-        res[i] = params.modulus - a[i];
+        res[i] = negate_mod(a[i], params.modulus);
     }
 }
 
@@ -467,7 +471,7 @@ pub fn automorph_poly(params: &Params, res: &mut [u64], a: &[u64], t: usize) {
         if num % 2 == 0 {
             res[rem] = a[i];
         } else {
-            res[rem] = params.modulus - a[i];
+            res[rem] = negate_mod(a[i], params.modulus);
         }
     }
 }
@@ -484,7 +488,7 @@ pub fn automorph_poly_uncrtd(params: &Params, res: &mut [u64], a: &[u64], t: usi
             if num % 2 == 0 {
                 res_chunk[rem] = a_chunk[i];
             } else {
-                res_chunk[rem] = params.moduli[m] - a_chunk[i];
+                res_chunk[rem] = negate_mod(a_chunk[i], params.moduli[m]);
             }
         }
     }
