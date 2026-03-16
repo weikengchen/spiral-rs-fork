@@ -1,6 +1,17 @@
+#[cfg(target_arch = "x86_64")]
 use std::arch::x86_64::*;
+#[cfg(target_arch = "aarch64")]
+use std::arch::aarch64::*;
 
 use crate::{arith::*, number_theory::*, params::*};
+
+/// Multiply the low 32 bits of each u64 lane, producing full 64-bit results.
+/// Equivalent to x86 `_mm256_mul_epu32` but for NEON's 128-bit (2×u64) registers.
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+pub(crate) unsafe fn mul_epu32_neon(a: uint64x2_t, b: uint64x2_t) -> uint64x2_t {
+    vmull_u32(vmovn_u64(a), vmovn_u64(b))
+}
 
 pub fn powers_of_primitive_root(root: u64, modulus: u64, poly_len_log2: usize) -> Vec<u64> {
     let poly_len = 1usize << poly_len_log2;
@@ -106,7 +117,7 @@ pub fn build_ntt_tables(
     output
 }
 
-#[cfg(not(target_feature = "avx2"))]
+#[cfg(all(not(target_feature = "avx2"), not(target_arch = "aarch64")))]
 pub fn ntt_forward(params: &Params, operand_overall: &mut [u64]) {
     if params.crt_count == 1 {
         ntt_forward_alt(params, operand_overall);
@@ -154,6 +165,108 @@ pub fn ntt_forward(params: &Params, operand_overall: &mut [u64]) {
             operand[i] -= ((operand[i] >= two_times_modulus_small as u64) as u64)
                 * two_times_modulus_small as u64;
             operand[i] -= ((operand[i] >= modulus_small as u64) as u64) * modulus_small as u64;
+        }
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+pub fn ntt_forward(params: &Params, operand_overall: &mut [u64]) {
+    if params.crt_count == 1 {
+        ntt_forward_alt(params, operand_overall);
+        return;
+    }
+    let log_n = params.poly_len_log2;
+    let n = 1 << log_n;
+
+    for coeff_mod in 0..params.crt_count {
+        let operand = unsafe {
+            std::slice::from_raw_parts_mut(operand_overall.as_mut_ptr().add(coeff_mod * n), n)
+        };
+
+        let forward_table = params.get_ntt_forward_table(coeff_mod);
+        let forward_table_prime = params.get_ntt_forward_prime_table(coeff_mod);
+        let modulus_small = params.moduli[coeff_mod] as u32;
+        let two_times_modulus_small: u32 = 2 * modulus_small;
+
+        for mm in 0..log_n {
+            let m = 1 << mm;
+            let t = n >> (mm + 1);
+
+            for i in 0..m {
+                let w = unsafe { *forward_table.get_unchecked(m + i) };
+                let w_prime = unsafe { *forward_table_prime.get_unchecked(m + i) };
+
+                let op = unsafe {
+                    std::slice::from_raw_parts_mut(operand.as_mut_ptr().add(2 * t * i), 2 * t)
+                };
+
+                if t < 2 {
+                    for j in 0..t {
+                        let x: u32 = unsafe { *op.get_unchecked(j) as u32 };
+                        let y: u32 = unsafe { *op.get_unchecked(t + j) as u32 };
+
+                        let curr_x: u32 =
+                            x - (two_times_modulus_small * ((x >= two_times_modulus_small) as u32));
+                        let q_tmp: u64 = ((y as u64) * (w_prime as u64)) >> 32u64;
+                        let q_new = w * (y as u64) - q_tmp * (modulus_small as u64);
+
+                        unsafe {
+                            *op.get_unchecked_mut(j) = curr_x as u64 + q_new;
+                            *op.get_unchecked_mut(t + j) =
+                                curr_x as u64 + ((two_times_modulus_small as u64) - q_new);
+                        }
+                    }
+                } else {
+                    unsafe {
+                        for j in (0..t).step_by(2) {
+                            let p_x = op.get_unchecked_mut(j) as *mut u64;
+                            let p_y = op.get_unchecked_mut(j + t) as *mut u64;
+                            let x = vld1q_u64(p_x);
+                            let y = vld1q_u64(p_y);
+
+                            let cmp_val = vdupq_n_u64(two_times_modulus_small as u64);
+                            let gt_mask = vcgtq_u64(x, cmp_val);
+                            let to_subtract = vandq_u64(gt_mask, cmp_val);
+                            let curr_x = vsubq_u64(x, to_subtract);
+
+                            let w_prime_vec = vdupq_n_u64(w_prime);
+                            let product = mul_epu32_neon(y, w_prime_vec);
+                            let q_val = vshrq_n_u64::<32>(product);
+
+                            let w_vec = vdupq_n_u64(w);
+                            let w_times_y = mul_epu32_neon(y, w_vec);
+                            let modulus_small_vec = vdupq_n_u64(modulus_small as u64);
+                            let q_scaled = mul_epu32_neon(q_val, modulus_small_vec);
+                            let q_final = vsubq_u64(w_times_y, q_scaled);
+
+                            let new_x = vaddq_u64(curr_x, q_final);
+                            let q_final_inverted = vsubq_u64(cmp_val, q_final);
+                            let new_y = vaddq_u64(curr_x, q_final_inverted);
+
+                            vst1q_u64(p_x, new_x);
+                            vst1q_u64(p_y, new_y);
+                        }
+                    }
+                }
+            }
+        }
+
+        for i in (0..n).step_by(2) {
+            unsafe {
+                let p_x = operand.get_unchecked_mut(i) as *mut u64;
+
+                let cmp_val1 = vdupq_n_u64(two_times_modulus_small as u64);
+                let mut x = vld1q_u64(p_x);
+                let mut ge_mask = vcgeq_u64(x, cmp_val1);
+                let mut to_subtract = vandq_u64(ge_mask, cmp_val1);
+                x = vsubq_u64(x, to_subtract);
+
+                let cmp_val2 = vdupq_n_u64(modulus_small as u64);
+                ge_mask = vcgeq_u64(x, cmp_val2);
+                to_subtract = vandq_u64(ge_mask, cmp_val2);
+                x = vsubq_u64(x, to_subtract);
+                vst1q_u64(p_x, x);
+            }
         }
     }
 }
@@ -454,6 +567,7 @@ pub fn ntt_inverse_alt(params: &Params, operand_overall: &mut [u64]) {
     }
 }
 
+#[cfg(target_arch = "x86_64")]
 pub fn ntt_inverse_256(params: &Params, operand_overall: &mut [u64]) {
     if params.crt_count == 1 {
         ntt_inverse_alt(params, operand_overall);
@@ -564,6 +678,325 @@ pub fn ntt_inverse_256(params: &Params, operand_overall: &mut [u64]) {
     }
 }
 
+#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+pub fn ntt_inverse_256(params: &Params, operand_overall: &mut [u64]) {
+    if params.crt_count == 1 {
+        ntt_inverse_alt(params, operand_overall);
+        return;
+    }
+    for coeff_mod in 0..params.crt_count {
+        let n = params.poly_len;
+
+        let operand = &mut operand_overall[coeff_mod * n..coeff_mod * n + n];
+
+        let inverse_table = params.get_ntt_inverse_table(coeff_mod);
+        let inverse_table_prime = params.get_ntt_inverse_prime_table(coeff_mod);
+        let modulus = params.moduli[coeff_mod];
+        let two_times_modulus: u64 = 2 * modulus;
+        for mm in (0..params.poly_len_log2).rev() {
+            let h = 1 << mm;
+            let t = n >> (mm + 1);
+
+            let mut it = operand.chunks_exact_mut(2 * t);
+
+            for i in 0..h {
+                let w = inverse_table[h + i];
+                let w_prime = inverse_table_prime[h + i];
+
+                let op = it.next().unwrap();
+
+                for j in 0..t {
+                    let x = op[j];
+                    let y = op[t + j];
+
+                    let t_tmp = two_times_modulus - y + x;
+                    let curr_x = x + y - (two_times_modulus * (((x << 1) >= t_tmp) as u64));
+                    let h_tmp = (t_tmp * w_prime) >> 32;
+
+                    let res_x = (curr_x + (modulus * ((t_tmp & 1) as u64))) >> 1;
+                    let res_y = w * t_tmp - h_tmp * modulus;
+
+                    op[j] = res_x;
+                    op[t + j] = res_y;
+                }
+            }
+        }
+
+        for i in 0..n {
+            operand[i] -= ((operand[i] >= two_times_modulus) as u64) * two_times_modulus;
+            operand[i] -= ((operand[i] >= modulus) as u64) * modulus;
+        }
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+pub fn ntt_inverse_256(params: &Params, operand_overall: &mut [u64]) {
+    if params.crt_count == 1 {
+        ntt_inverse_alt(params, operand_overall);
+        return;
+    }
+    for coeff_mod in 0..params.crt_count {
+        let n = params.poly_len;
+
+        let operand = &mut operand_overall[coeff_mod * n..coeff_mod * n + n];
+
+        let inverse_table = params.get_ntt_inverse_table(coeff_mod);
+        let inverse_table_prime = params.get_ntt_inverse_prime_table(coeff_mod);
+        let modulus = params.moduli[coeff_mod];
+        let two_times_modulus: u64 = 2 * modulus;
+        for mm in (0..params.poly_len_log2).rev() {
+            let h = 1 << mm;
+            let t = n >> (mm + 1);
+
+            let mut it = operand.chunks_exact_mut(2 * t);
+
+            for i in 0..h {
+                let w = inverse_table[h + i];
+                let w_prime = inverse_table_prime[h + i];
+
+                let op = it.next().unwrap();
+
+                if t < 2 {
+                    for j in 0..t {
+                        let x = op[j];
+                        let y = op[t + j];
+
+                        let t_tmp = two_times_modulus - y + x;
+                        let curr_x =
+                            x + y - (two_times_modulus * (((x << 1) >= t_tmp) as u64));
+                        let h_tmp = (t_tmp * w_prime) >> 32;
+
+                        let res_x = (curr_x + (modulus * ((t_tmp & 1) as u64))) >> 1;
+                        let res_y = w * t_tmp - h_tmp * modulus;
+
+                        op[j] = res_x;
+                        op[t + j] = res_y;
+                    }
+                } else {
+                    unsafe {
+                        for j in (0..t).step_by(2) {
+                            let p_x = &mut op[j] as *mut u64;
+                            let p_y = &mut op[j + t] as *mut u64;
+                            let x = vld1q_u64(p_x);
+                            let y = vld1q_u64(p_y);
+
+                            let modulus_vec = vdupq_n_u64(modulus);
+                            let two_times_modulus_vec = vdupq_n_u64(two_times_modulus);
+                            let mut t_tmp = vdupq_n_u64(two_times_modulus);
+                            t_tmp = vsubq_u64(t_tmp, y);
+                            t_tmp = vaddq_u64(t_tmp, x);
+                            let gt_mask = vcgtq_u64(vshlq_n_u64::<1>(x), t_tmp);
+                            let to_subtract = vandq_u64(gt_mask, two_times_modulus_vec);
+                            let mut curr_x = vaddq_u64(x, y);
+                            curr_x = vsubq_u64(curr_x, to_subtract);
+
+                            let w_prime_vec = vdupq_n_u64(w_prime);
+                            let mut h_tmp = mul_epu32_neon(t_tmp, w_prime_vec);
+                            h_tmp = vshrq_n_u64::<32>(h_tmp);
+
+                            let and_mask = vdupq_n_u64(1);
+                            let eq_mask =
+                                vceqq_u64(vandq_u64(t_tmp, and_mask), and_mask);
+                            let to_add = vandq_u64(eq_mask, modulus_vec);
+
+                            let new_x =
+                                vshrq_n_u64::<1>(vaddq_u64(curr_x, to_add));
+
+                            let w_vec = vdupq_n_u64(w);
+                            let w_times_t_tmp = mul_epu32_neon(t_tmp, w_vec);
+                            let h_tmp_times_modulus =
+                                mul_epu32_neon(h_tmp, modulus_vec);
+                            let new_y =
+                                vsubq_u64(w_times_t_tmp, h_tmp_times_modulus);
+
+                            vst1q_u64(p_x, new_x);
+                            vst1q_u64(p_y, new_y);
+                        }
+                    }
+                }
+            }
+        }
+
+        for i in (0..n).step_by(2) {
+            unsafe {
+                let p_x = &mut operand[i] as *mut u64;
+
+                let cmp_val1 = vdupq_n_u64(two_times_modulus);
+                let mut x = vld1q_u64(p_x);
+                let mut ge_mask = vcgeq_u64(x, cmp_val1);
+                let mut to_subtract = vandq_u64(ge_mask, cmp_val1);
+                x = vsubq_u64(x, to_subtract);
+
+                let cmp_val2 = vdupq_n_u64(modulus);
+                ge_mask = vcgeq_u64(x, cmp_val2);
+                to_subtract = vandq_u64(ge_mask, cmp_val2);
+                x = vsubq_u64(x, to_subtract);
+                vst1q_u64(p_x, x);
+            }
+        }
+    }
+}
+
+#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+pub fn ntt_inverse(params: &Params, operand_overall: &mut [u64]) {
+    if params.crt_count == 1 {
+        ntt_inverse_alt(params, operand_overall);
+        return;
+    }
+    for coeff_mod in 0..params.crt_count {
+        let n = params.poly_len;
+
+        let operand = &mut operand_overall[coeff_mod * n..coeff_mod * n + n];
+
+        let inverse_table = params.get_ntt_inverse_table(coeff_mod);
+        let inverse_table_prime = params.get_ntt_inverse_prime_table(coeff_mod);
+        let modulus = params.moduli[coeff_mod];
+        let two_times_modulus: u64 = 2 * modulus;
+        for mm in (0..params.poly_len_log2).rev() {
+            let h = 1 << mm;
+            let t = n >> (mm + 1);
+
+            let mut it = operand.chunks_exact_mut(2 * t);
+
+            for i in 0..h {
+                let w = inverse_table[h + i];
+                let w_prime = inverse_table_prime[h + i];
+
+                let op = it.next().unwrap();
+
+                for j in 0..t {
+                    let x = op[j];
+                    let y = op[t + j];
+
+                    let t_tmp = two_times_modulus - y + x;
+                    let curr_x = x + y - (two_times_modulus * (((x << 1) >= t_tmp) as u64));
+                    let h_tmp = (t_tmp * w_prime) >> 32;
+
+                    let res_x = (curr_x + (modulus * ((t_tmp & 1) as u64))) >> 1;
+                    let res_y = w * t_tmp - h_tmp * modulus;
+
+                    op[j] = res_x;
+                    op[t + j] = res_y;
+                }
+            }
+        }
+
+        for i in 0..n {
+            operand[i] -= ((operand[i] >= two_times_modulus) as u64) * two_times_modulus;
+            operand[i] -= ((operand[i] >= modulus) as u64) * modulus;
+        }
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+pub fn ntt_inverse(params: &Params, operand_overall: &mut [u64]) {
+    if params.crt_count == 1 {
+        ntt_inverse_alt(params, operand_overall);
+        return;
+    }
+    for coeff_mod in 0..params.crt_count {
+        let n = params.poly_len;
+
+        let operand = &mut operand_overall[coeff_mod * n..coeff_mod * n + n];
+
+        let inverse_table = params.get_ntt_inverse_table(coeff_mod);
+        let inverse_table_prime = params.get_ntt_inverse_prime_table(coeff_mod);
+        let modulus = params.moduli[coeff_mod];
+        let two_times_modulus: u64 = 2 * modulus;
+        for mm in (0..params.poly_len_log2).rev() {
+            let h = 1 << mm;
+            let t = n >> (mm + 1);
+
+            let mut it = operand.chunks_exact_mut(2 * t);
+
+            for i in 0..h {
+                let w = inverse_table[h + i];
+                let w_prime = inverse_table_prime[h + i];
+
+                let op = it.next().unwrap();
+
+                if t < 2 {
+                    for j in 0..t {
+                        let x = op[j];
+                        let y = op[t + j];
+
+                        let t_tmp = two_times_modulus - y + x;
+                        let curr_x =
+                            x + y - (two_times_modulus * (((x << 1) >= t_tmp) as u64));
+                        let h_tmp = (t_tmp * w_prime) >> 32;
+
+                        let res_x = (curr_x + (modulus * ((t_tmp & 1) as u64))) >> 1;
+                        let res_y = w * t_tmp - h_tmp * modulus;
+
+                        op[j] = res_x;
+                        op[t + j] = res_y;
+                    }
+                } else {
+                    unsafe {
+                        for j in (0..t).step_by(2) {
+                            let p_x = &mut op[j] as *mut u64;
+                            let p_y = &mut op[j + t] as *mut u64;
+                            let x = vld1q_u64(p_x);
+                            let y = vld1q_u64(p_y);
+
+                            let modulus_vec = vdupq_n_u64(modulus);
+                            let two_times_modulus_vec = vdupq_n_u64(two_times_modulus);
+                            let mut t_tmp = vdupq_n_u64(two_times_modulus);
+                            t_tmp = vsubq_u64(t_tmp, y);
+                            t_tmp = vaddq_u64(t_tmp, x);
+                            let gt_mask = vcgtq_u64(vshlq_n_u64::<1>(x), t_tmp);
+                            let to_subtract = vandq_u64(gt_mask, two_times_modulus_vec);
+                            let mut curr_x = vaddq_u64(x, y);
+                            curr_x = vsubq_u64(curr_x, to_subtract);
+
+                            let w_prime_vec = vdupq_n_u64(w_prime);
+                            let mut h_tmp = mul_epu32_neon(t_tmp, w_prime_vec);
+                            h_tmp = vshrq_n_u64::<32>(h_tmp);
+
+                            let and_mask = vdupq_n_u64(1);
+                            let eq_mask =
+                                vceqq_u64(vandq_u64(t_tmp, and_mask), and_mask);
+                            let to_add = vandq_u64(eq_mask, modulus_vec);
+
+                            let new_x =
+                                vshrq_n_u64::<1>(vaddq_u64(curr_x, to_add));
+
+                            let w_vec = vdupq_n_u64(w);
+                            let w_times_t_tmp = mul_epu32_neon(t_tmp, w_vec);
+                            let h_tmp_times_modulus =
+                                mul_epu32_neon(h_tmp, modulus_vec);
+                            let new_y =
+                                vsubq_u64(w_times_t_tmp, h_tmp_times_modulus);
+
+                            vst1q_u64(p_x, new_x);
+                            vst1q_u64(p_y, new_y);
+                        }
+                    }
+                }
+            }
+        }
+
+        for i in (0..n).step_by(2) {
+            unsafe {
+                let p_x = &mut operand[i] as *mut u64;
+
+                let cmp_val1 = vdupq_n_u64(two_times_modulus);
+                let mut x = vld1q_u64(p_x);
+                let mut ge_mask = vcgeq_u64(x, cmp_val1);
+                let mut to_subtract = vandq_u64(ge_mask, cmp_val1);
+                x = vsubq_u64(x, to_subtract);
+
+                let cmp_val2 = vdupq_n_u64(modulus);
+                ge_mask = vcgeq_u64(x, cmp_val2);
+                to_subtract = vandq_u64(ge_mask, cmp_val2);
+                x = vsubq_u64(x, to_subtract);
+                vst1q_u64(p_x, x);
+            }
+        }
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
 pub fn ntt_inverse(params: &Params, operand_overall: &mut [u64]) {
     if params.crt_count == 1 {
         ntt_inverse_alt(params, operand_overall);
@@ -891,5 +1324,168 @@ mod test {
     fn calc_index_correct() {
         assert_eq!(calc_index(&[2, 3, 4], &[10, 10, 100]), 2304);
         assert_eq!(calc_index(&[2, 3, 4], &[3, 5, 7]), 95);
+    }
+
+    // Standalone scalar NTT functions for benchmarking (always compiled, no cfg gate)
+    fn ntt_forward_scalar(params: &Params, operand_overall: &mut [u64]) {
+        if params.crt_count == 1 {
+            ntt_forward_alt(params, operand_overall);
+            return;
+        }
+        let log_n = params.poly_len_log2;
+        let n = 1 << log_n;
+
+        for coeff_mod in 0..params.crt_count {
+            let operand = &mut operand_overall[coeff_mod * n..coeff_mod * n + n];
+
+            let forward_table = params.get_ntt_forward_table(coeff_mod);
+            let forward_table_prime = params.get_ntt_forward_prime_table(coeff_mod);
+            let modulus_small = params.moduli[coeff_mod] as u32;
+            let two_times_modulus_small: u32 = 2 * modulus_small;
+
+            for mm in 0..log_n {
+                let m = 1 << mm;
+                let t = n >> (mm + 1);
+
+                let mut it = operand.chunks_exact_mut(2 * t);
+
+                for i in 0..m {
+                    let w = forward_table[m + i];
+                    let w_prime = forward_table_prime[m + i];
+
+                    let op = it.next().unwrap();
+
+                    for j in 0..t {
+                        let x: u32 = op[j] as u32;
+                        let y: u32 = op[t + j] as u32;
+
+                        let curr_x: u32 =
+                            x - (two_times_modulus_small * ((x >= two_times_modulus_small) as u32));
+                        let q_tmp: u64 = ((y as u64) * (w_prime as u64)) >> 32u64;
+                        let q_new = w * (y as u64) - q_tmp * (modulus_small as u64);
+
+                        op[j] = curr_x as u64 + q_new;
+                        op[t + j] = curr_x as u64 + ((two_times_modulus_small as u64) - q_new);
+                    }
+                }
+            }
+
+            for i in 0..n {
+                operand[i] -= ((operand[i] >= two_times_modulus_small as u64) as u64)
+                    * two_times_modulus_small as u64;
+                operand[i] -= ((operand[i] >= modulus_small as u64) as u64) * modulus_small as u64;
+            }
+        }
+    }
+
+    fn ntt_inverse_scalar(params: &Params, operand_overall: &mut [u64]) {
+        if params.crt_count == 1 {
+            ntt_inverse_alt(params, operand_overall);
+            return;
+        }
+        for coeff_mod in 0..params.crt_count {
+            let n = params.poly_len;
+
+            let operand = &mut operand_overall[coeff_mod * n..coeff_mod * n + n];
+
+            let inverse_table = params.get_ntt_inverse_table(coeff_mod);
+            let inverse_table_prime = params.get_ntt_inverse_prime_table(coeff_mod);
+            let modulus = params.moduli[coeff_mod];
+            let two_times_modulus: u64 = 2 * modulus;
+            for mm in (0..params.poly_len_log2).rev() {
+                let h = 1 << mm;
+                let t = n >> (mm + 1);
+
+                let mut it = operand.chunks_exact_mut(2 * t);
+
+                for i in 0..h {
+                    let w = inverse_table[h + i];
+                    let w_prime = inverse_table_prime[h + i];
+
+                    let op = it.next().unwrap();
+
+                    for j in 0..t {
+                        let x = op[j];
+                        let y = op[t + j];
+
+                        let t_tmp = two_times_modulus - y + x;
+                        let curr_x =
+                            x + y - (two_times_modulus * (((x << 1) >= t_tmp) as u64));
+                        let h_tmp = (t_tmp * w_prime) >> 32;
+
+                        let res_x = (curr_x + (modulus * ((t_tmp & 1) as u64))) >> 1;
+                        let res_y = w * t_tmp - h_tmp * modulus;
+
+                        op[j] = res_x;
+                        op[t + j] = res_y;
+                    }
+                }
+            }
+
+            for i in 0..n {
+                operand[i] -= ((operand[i] >= two_times_modulus) as u64) * two_times_modulus;
+                operand[i] -= ((operand[i] >= modulus) as u64) * modulus;
+            }
+        }
+    }
+
+    #[test]
+    fn ntt_bench_scalar_vs_simd() {
+        let params = get_params();
+        let trials = 1000;
+        let chunk_sz = params.crt_count * params.poly_len;
+        let mut rng = rand::thread_rng();
+
+        // Prepare random data
+        let mut v_simd = AlignedMemory64::new(trials * chunk_sz);
+        for trial in 0..trials {
+            for i in 0..params.crt_count {
+                for j in 0..params.poly_len {
+                    let idx = calc_index(&[trial, i, j], &[trials, params.crt_count, params.poly_len]);
+                    let val: u64 = rng.gen();
+                    v_simd[idx] = val % params.moduli[i];
+                }
+            }
+        }
+        let mut v_scalar = v_simd.clone();
+
+        // Benchmark SIMD (NEON on aarch64, AVX on x86_64) forward + inverse
+        let now = Instant::now();
+        for chunk in v_simd.as_mut_slice().chunks_exact_mut(chunk_sz) {
+            ntt_forward(&params, chunk);
+        }
+        let simd_fwd = now.elapsed();
+
+        let now = Instant::now();
+        for chunk in v_simd.as_mut_slice().chunks_exact_mut(chunk_sz) {
+            ntt_inverse(&params, chunk);
+        }
+        let simd_inv = now.elapsed();
+
+        // Benchmark scalar forward + inverse
+        let now = Instant::now();
+        for chunk in v_scalar.as_mut_slice().chunks_exact_mut(chunk_sz) {
+            ntt_forward_scalar(&params, chunk);
+        }
+        let scalar_fwd = now.elapsed();
+
+        let now = Instant::now();
+        for chunk in v_scalar.as_mut_slice().chunks_exact_mut(chunk_sz) {
+            ntt_inverse_scalar(&params, chunk);
+        }
+        let scalar_inv = now.elapsed();
+
+        // Verify both produce identical results
+        for i in 0..v_simd.len() {
+            assert_eq!(v_simd[i], v_scalar[i], "mismatch at index {}", i);
+        }
+
+        println!("=== NTT Benchmark ({} trials, poly_len={}) ===", trials, params.poly_len);
+        println!("  SIMD forward:   {:?}", simd_fwd);
+        println!("  Scalar forward: {:?}", scalar_fwd);
+        println!("  Forward speedup: {:.2}x", scalar_fwd.as_secs_f64() / simd_fwd.as_secs_f64());
+        println!("  SIMD inverse:   {:?}", simd_inv);
+        println!("  Scalar inverse: {:?}", scalar_inv);
+        println!("  Inverse speedup: {:.2}x", scalar_inv.as_secs_f64() / simd_inv.as_secs_f64());
     }
 }

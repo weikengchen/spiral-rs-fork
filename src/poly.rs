@@ -1,5 +1,7 @@
 #[cfg(target_feature = "avx2")]
 use std::arch::x86_64::*;
+#[cfg(target_arch = "aarch64")]
+use std::arch::aarch64::*;
 
 use rand::distributions::Standard;
 use rand::Rng;
@@ -443,9 +445,13 @@ pub fn sub_poly_into(params: &Params, res: &mut [u64], a: &[u64]) {
     }
 }
 
+fn negate_mod(val: u64, m: u64) -> u64 {
+    if val == 0 { 0 } else { m - val }
+}
+
 pub fn invert_poly(params: &Params, res: &mut [u64], a: &[u64]) {
     for i in 0..params.poly_len {
-        res[i] = params.modulus - a[i];
+        res[i] = negate_mod(a[i], params.modulus);
     }
 }
 
@@ -467,7 +473,7 @@ pub fn automorph_poly(params: &Params, res: &mut [u64], a: &[u64], t: usize) {
         if num % 2 == 0 {
             res[rem] = a[i];
         } else {
-            res[rem] = params.modulus - a[i];
+            res[rem] = negate_mod(a[i], params.modulus);
         }
     }
 }
@@ -484,7 +490,7 @@ pub fn automorph_poly_uncrtd(params: &Params, res: &mut [u64], a: &[u64], t: usi
             if num % 2 == 0 {
                 res_chunk[rem] = a_chunk[i];
             } else {
-                res_chunk[rem] = params.moduli[m] - a_chunk[i];
+                res_chunk[rem] = negate_mod(a_chunk[i], params.moduli[m]);
             }
         }
     }
@@ -506,6 +512,28 @@ pub fn multiply_add_poly_avx(params: &Params, res: &mut [u64], a: &[u64], b: &[u
                 let out = _mm256_add_epi64(z, product);
 
                 _mm256_store_si256(p_z as *mut __m256i, out);
+            }
+        }
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+pub fn multiply_add_poly_neon(params: &Params, res: &mut [u64], a: &[u64], b: &[u64]) {
+    for c in 0..params.crt_count {
+        let base = c * params.poly_len;
+        for i in (0..params.poly_len).step_by(2) {
+            unsafe {
+                let p_x = &a[base + i] as *const u64;
+                let p_y = &b[base + i] as *const u64;
+                let p_z = &mut res[base + i] as *mut u64;
+                let x = vld1q_u64(p_x);
+                let y = vld1q_u64(p_y);
+                let z = vld1q_u64(p_z);
+
+                let product = crate::ntt::mul_epu32_neon(x, y);
+                let out = vaddq_u64(z, product);
+
+                vst1q_u64(p_z, out);
             }
         }
     }
@@ -539,7 +567,7 @@ pub fn modular_reduce(params: &Params, res: &mut [u64]) {
     }
 }
 
-#[cfg(not(target_feature = "avx2"))]
+#[cfg(all(not(target_feature = "avx2"), not(target_arch = "aarch64")))]
 pub fn multiply(res: &mut PolyMatrixNTT, a: &PolyMatrixNTT, b: &PolyMatrixNTT) {
     assert!(res.rows == a.rows);
     assert!(res.cols == b.cols);
@@ -557,6 +585,39 @@ pub fn multiply(res: &mut PolyMatrixNTT, a: &PolyMatrixNTT, b: &PolyMatrixNTT) {
                 let pol1 = a.get_poly(i, k);
                 let pol2 = b.get_poly(k, j);
                 multiply_add_poly(params, res_poly, pol1, pol2);
+            }
+        }
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+pub fn multiply(res: &mut PolyMatrixNTT, a: &PolyMatrixNTT, b: &PolyMatrixNTT) {
+    assert_eq!(res.rows, a.rows);
+    assert_eq!(res.cols, b.cols);
+    assert_eq!(a.cols, b.rows);
+
+    let params = res.params;
+    // NEON accumulate-then-reduce is faster than per-element Barrett when the inner
+    // dimension (a.cols) is >= 3, because the deferred reduction amortizes well.
+    // For small inner dims or large moduli (crt_count == 1), scalar is faster.
+    let use_neon = params.crt_count > 1 && a.cols >= 3;
+    for i in 0..a.rows {
+        for j in 0..b.cols {
+            for z in 0..params.poly_len * params.crt_count {
+                res.get_poly_mut(i, j)[z] = 0;
+            }
+            let res_poly = res.get_poly_mut(i, j);
+            for k in 0..a.cols {
+                let pol1 = a.get_poly(i, k);
+                let pol2 = b.get_poly(k, j);
+                if use_neon {
+                    multiply_add_poly_neon(params, res_poly, pol1, pol2);
+                } else {
+                    multiply_add_poly(params, res_poly, pol1, pol2);
+                }
+            }
+            if use_neon {
+                modular_reduce(params, res_poly);
             }
         }
     }
@@ -989,6 +1050,64 @@ mod test {
         let m3_ntt = &m1_ntt * &m2_ntt;
         let m3 = from_ntt_alloc(&m3_ntt);
         assert_eq!(m3.get_poly(0, 0)[2], 700);
+    }
+
+    // Standalone scalar multiply for benchmarking (always compiled, no cfg gate)
+    fn multiply_scalar(res: &mut PolyMatrixNTT, a: &PolyMatrixNTT, b: &PolyMatrixNTT) {
+        let params = res.params;
+        for i in 0..a.rows {
+            for j in 0..b.cols {
+                for z in 0..params.poly_len * params.crt_count {
+                    res.get_poly_mut(i, j)[z] = 0;
+                }
+                for k in 0..a.cols {
+                    let params = res.params;
+                    let res_poly = res.get_poly_mut(i, j);
+                    let pol1 = a.get_poly(i, k);
+                    let pol2 = b.get_poly(k, j);
+                    multiply_add_poly(params, res_poly, pol1, pol2);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn multiply_bench_scalar_vs_simd() {
+        use std::time::Instant;
+
+        let params = get_params();
+        let trials = 1000;
+
+        // Test with multiple matrix sizes
+        for &(rows_a, cols_a, cols_b) in &[(2, 1, 1), (2, 2, 1), (4, 4, 1)] {
+        let a = PolyMatrixNTT::random(&params, rows_a, cols_a);
+        let b = PolyMatrixNTT::random(&params, cols_a, cols_b);
+        let mut res_simd = PolyMatrixNTT::zero(&params, rows_a, cols_b);
+        let mut res_scalar = PolyMatrixNTT::zero(&params, rows_a, cols_b);
+
+        // Benchmark SIMD (NEON on aarch64, AVX on x86)
+        let now = Instant::now();
+        for _ in 0..trials {
+            multiply(&mut res_simd, &a, &b);
+        }
+        let simd_time = now.elapsed();
+
+        // Benchmark scalar
+        let now = Instant::now();
+        for _ in 0..trials {
+            multiply_scalar(&mut res_scalar, &a, &b);
+        }
+        let scalar_time = now.elapsed();
+
+        // Verify identical results
+        assert_eq!(res_simd.as_slice(), res_scalar.as_slice());
+
+        println!("=== Poly Multiply Benchmark ({} trials, {}x{} * {}x{}) ===",
+            trials, rows_a, cols_a, cols_a, cols_b);
+        println!("  SIMD:    {:?}", simd_time);
+        println!("  Scalar:  {:?}", scalar_time);
+        println!("  Speedup: {:.2}x", scalar_time.as_secs_f64() / simd_time.as_secs_f64());
+        } // end for matrix sizes
     }
 
     #[test]
