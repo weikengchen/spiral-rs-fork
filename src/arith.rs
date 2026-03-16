@@ -185,7 +185,7 @@ fn barrett_raw_u128(val: u128, cr0: u64, cr1: u64, modulus: u64) -> u64 {
     tmp3 = tmp2y + add_u64(tmp2x, carry, &mut tmp1);
     (tmp2x, tmp2y) = mul_u128(zy, cr0);
     carry = tmp2y + add_u64(tmp1, tmp2x, &mut tmp1);
-    tmp1 = zy * cr1 + tmp3 + carry;
+    tmp1 = zy.wrapping_mul(cr1).wrapping_add(tmp3).wrapping_add(carry);
     tmp3 = zx.wrapping_sub(tmp1.wrapping_mul(modulus));
 
     tmp3
